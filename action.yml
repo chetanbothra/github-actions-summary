@@ -1,0 +1,92 @@
+name: "Kubernetes Deployment Summary"
+description: "Generate GitHub Summary for K8s deployment and detect failures"
+author: "DevOps Bot"
+
+inputs:
+  namespace:
+    description: "Kubernetes namespace"
+    required: true
+  app_name:
+    description: "Kubernetes deployment name"
+    required: true
+  notify_users:
+    description: "Comma separated GitHub usernames to tag in case of failure"
+    required: false
+    default: ""
+
+outputs:
+  result:
+    description: "success or failure status"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Generate K8s Deployment Summary
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        echo "Checking deployment rollout..."
+        if ! kubectl rollout status deploy/${{ inputs.app_name }} -n ${{ inputs.namespace }} --timeout=90s; then
+          RESULT="failure"
+        else
+          RESULT="success"
+        fi
+
+        # Metadata
+        echo "## 🚀 Deployment summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Namespace:** ${{ inputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Deployment:** ${{ inputs.app_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Triggered by:** @${GITHUB_ACTOR}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Commit:** ${GITHUB_SHA}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Pods
+        echo "### 🔍 Pods" >> $GITHUB_STEP_SUMMARY
+        PODS_RAW="$(kubectl -n ${{ inputs.namespace }} get pods -l app=${{ inputs.app_name }} -o wide --no-headers 2>/dev/null || true)"
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "$PODS_RAW" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+        BAD_PODS="$(echo "$PODS_RAW" | awk '{split($2,r,"/"); if(r[1]<r[2] || $3 ~ /CrashLoopBackOff|Error/) print $1}' || true)"
+
+        if [ "$RESULT" = "failure" ] || [ -n "$BAD_PODS" ]; then
+          RESULT="failure"
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ⚠️ Problematic Pods Detected" >> $GITHUB_STEP_SUMMARY
+
+          MENTION=""
+          for u in $(echo "${{ inputs.notify_users }}" | tr ',' ' '); do
+            MENTION="$MENTION @$u"
+          done
+
+          if [ -n "$MENTION" ]; then
+            echo "- Notifying: $MENTION" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          for p in $BAD_PODS; do
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "#### ❌ Pod: $p" >> $GITHUB_STEP_SUMMARY
+
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            kubectl -n ${{ inputs.namespace }} describe pod "$p" || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            kubectl -n ${{ inputs.namespace }} logs "$p" --all-containers --tail=200 || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          done
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🕑 Recent Namespace Events" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl -n ${{ inputs.namespace }} get events --sort-by='.metadata.creationTimestamp' | tail -n 50 || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        else
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ All pods are running correctly." >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "result=$RESULT" >> $GITHUB_OUTPUT

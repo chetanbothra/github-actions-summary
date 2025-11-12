@@ -1,5 +1,5 @@
 name: "Kubernetes Deployment Summary"
-description: "Generate GitHub Summary for K8s deployment and detect failures"
+description: "Generate GitHub Summary for K8s resource (Deployment, StatefulSet, or DaemonSet) and detect failures"
 author: "DevOps Bot"
 
 inputs:
@@ -7,7 +7,7 @@ inputs:
     description: "Kubernetes namespace"
     required: true
   app_name:
-    description: "Kubernetes deployment name"
+    description: "Kubernetes resource name (Deployment, StatefulSet, or DaemonSet)"
     required: true
   notify_users:
     description: "Comma separated GitHub usernames to tag in case of failure"
@@ -26,30 +26,46 @@ runs:
       run: |
         set -euo pipefail
 
-        echo "Checking deployment rollout..."
-        if ! kubectl rollout status deploy/${{ inputs.app_name }} -n ${{ inputs.namespace }} --timeout=90s; then
+        echo "🔎 Detecting resource type..."
+        RESOURCE_TYPE=""
+
+        if kubectl get deploy/${{ inputs.app_name }} -n ${{ inputs.namespace }} &>/dev/null; then
+          RESOURCE_TYPE="deployment"
+        elif kubectl get statefulset/${{ inputs.app_name }} -n ${{ inputs.namespace }} &>/dev/null; then
+          RESOURCE_TYPE="statefulset"
+        elif kubectl get daemonset/${{ inputs.app_name }} -n ${{ inputs.namespace }} &>/dev/null; then
+          RESOURCE_TYPE="daemonset"
+        else
+          echo "❌ No matching resource (deployment/statefulset/daemonset) found with name '${{ inputs.app_name }}' in namespace '${{ inputs.namespace }}'"
+          echo "result=failure" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        echo "✅ Detected resource type: $RESOURCE_TYPE"
+
+        echo "⏳ Checking rollout status for $RESOURCE_TYPE/${{ inputs.app_name }}..."
+        if ! kubectl rollout status $RESOURCE_TYPE/${{ inputs.app_name }} -n ${{ inputs.namespace }} --timeout=150s; then
           RESULT="failure"
         else
           RESULT="success"
         fi
 
-        # Metadata
-        echo "## 🚀 Deployment summary" >> $GITHUB_STEP_SUMMARY
+        echo "## 🚀 Kubernetes Deployment Summary" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "- **Namespace:** ${{ inputs.namespace }}" >> $GITHUB_STEP_SUMMARY
-        echo "- **Deployment:** ${{ inputs.app_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Resource:** $RESOURCE_TYPE/${{ inputs.app_name }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Triggered by:** @${GITHUB_ACTOR}" >> $GITHUB_STEP_SUMMARY
         echo "- **Commit:** ${GITHUB_SHA}" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
 
-        # Pods
         echo "### 🔍 Pods" >> $GITHUB_STEP_SUMMARY
         PODS_RAW="$(kubectl -n ${{ inputs.namespace }} get pods -l app=${{ inputs.app_name }} -o wide --no-headers 2>/dev/null || true)"
         echo '```' >> $GITHUB_STEP_SUMMARY
         echo "$PODS_RAW" >> $GITHUB_STEP_SUMMARY
         echo '```' >> $GITHUB_STEP_SUMMARY
 
-        BAD_PODS="$(echo "$PODS_RAW" | awk '{split($2,r,"/"); if(r[1]<r[2] || $3 ~ /CrashLoopBackOff|Error/) print $1}' || true)"
+        # Detect problematic pods
+        BAD_PODS="$(echo "$PODS_RAW" | awk '{split($2,r,"/"); if(r[1]<r[2] || $3 ~ /CrashLoopBackOff|Error|Evicted|ImagePullBackOff/) print $1}' || true)"
 
         if [ "$RESULT" = "failure" ] || [ -n "$BAD_PODS" ]; then
           RESULT="failure"

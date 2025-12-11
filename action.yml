@@ -39,14 +39,14 @@ runs:
         else
           echo "❌ Resource '$APP' not found in '$NS'"
           echo "result=failure" >> $GITHUB_OUTPUT
-          exit 0
+          exit 1
         fi
 
         echo "⏳ Checking rollout status..."
-        if kubectl rollout status $RESOURCE_TYPE/"$APP" -n "$NS" --timeout=120s; then
-          RESULT="success"
-        else
-          RESULT="failure"
+
+        ROLLOUT_OK=true
+        if ! kubectl rollout status $RESOURCE_TYPE/"$APP" -n "$NS" --timeout=120s; then
+          ROLLOUT_OK=false
         fi
 
         echo "## 🚀 Kubernetes Deployment Summary" >> $GITHUB_STEP_SUMMARY
@@ -100,24 +100,29 @@ runs:
 
         echo '```' >> $GITHUB_STEP_SUMMARY
 
-        # Detect failing pods
+        echo ""
+        echo "### 🔎 Checking for problematic pods..." >> $GITHUB_STEP_SUMMARY
+
         BAD_PODS=$(echo "$PODS_JSON" | jq -r '
           .items[]
           | select(
               (.status.containerStatuses[]?.state.waiting.reason == "CrashLoopBackOff")
               or (.status.containerStatuses[]?.state.waiting.reason == "Error")
+              or (.status.containerStatuses[]?.state.waiting.reason == "CreateContainerConfigError")
+              or (.status.containerStatuses[]?.state.waiting.reason == "ImagePullBackOff")
               or ((.status.containerStatuses[]?.restartCount // 0) > 3)
           )
           | .metadata.name
         ')
 
+        FAILURE=false
+
         if [ -n "$BAD_PODS" ]; then
-          RESULT="failure"
+          FAILURE=true
+
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### ⚠️ Problematic Pods Detected" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Mentions
           if [ -n "$USERS" ]; then
             M="@${USERS//,/ @}"
             echo "- Notifying: $M" >> $GITHUB_STEP_SUMMARY
@@ -143,4 +148,10 @@ runs:
         kubectl get events -n "$NS" --sort-by='.metadata.creationTimestamp' | tail -50 || true
         echo '```' >> $GITHUB_STEP_SUMMARY
 
-        echo "result=$RESULT" >> $GITHUB_OUTPUT
+        # FINAL RESULT
+        if [ "$ROLLOUT_OK" = false ] || [ "$FAILURE" = true ]; then
+          echo "result=failure" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+        echo "result=success" >> $GITHUB_OUTPUT
